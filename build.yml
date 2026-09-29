@@ -4,28 +4,49 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ["main.mm", ".github/workflows/build.yml"]
+    paths:
+      - "main.mm"
+      - ".github/workflows/build.yml"
 
 jobs:
   build:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Compile AIMOLCore.dylib (iOS arm64)
         run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "Using SDK: $SDK"
           xcrun --sdk iphoneos clang++ \
-            -arch arm64 -dynamiclib -std=c++17 -fobjc-arc -O2 \
-            -miphoneos-version-min=13.0 -isysroot "$SDK" \
-            -framework UIKit -framework Foundation -framework WebKit \
+            -arch arm64 \
+            -dynamiclib \
+            -std=c++17 \
+            -fobjc-arc \
+            -O2 \
+            -miphoneos-version-min=13.0 \
+            -isysroot "$SDK" \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -framework WebKit \
             -install_name @executable_path/Frameworks/AIMOLCore.dylib \
-            -o AIMOLCore.dylib main.mm
+            -o AIMOLCore.dylib \
+            main.mm
+
+      - name: Verify output
+        run: |
+          set -euo pipefail
           file AIMOLCore.dylib
           lipo -info AIMOLCore.dylib
+          otool -L AIMOLCore.dylib
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: AIMOLCore
           path: AIMOLCore.dylib
+          if-no-files-found: error
