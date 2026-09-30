@@ -1026,15 +1026,22 @@ static NSString *TitleForCode(NSString *kind, NSString *code) {
 }
 
 - (UIWindow *)keyWindow {
-    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-        if ([sc isKindOfClass:[UIWindowScene class]] &&
-            sc.activationState == UISceneActivationStateForegroundActive) {
+    // Lượt 1: scene đang hoạt động. Lượt 2: scene bất kỳ. Lượt 3: danh sách cửa sổ của ứng dụng.
+    for (int pass = 0; pass < 2; pass++) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            if (pass == 0 && sc.activationState != UISceneActivationStateForegroundActive) continue;
             for (UIWindow *w in ((UIWindowScene *)sc).windows) {
                 if (w.isKeyWindow) return w;
             }
         }
     }
-    return nil;
+    UIWindow *fallback = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) return w;
+        if (!fallback && !w.hidden) fallback = w;
+    }
+    return fallback;
 }
 
 - (UITextField *)makeField:(NSString *)placeholder secure:(BOOL)secure defaultsKey:(NSString *)dkey {
@@ -1394,7 +1401,8 @@ static NSString *TitleForCode(NSString *kind, NSString *code) {
     NSString *q = Trim(self.input.text ? self.input.text : @"");
     if (q.length == 0 || !self.sendBtn.enabled) return;
     NSInteger prov = self.provSeg.selectedSegmentIndex;
-    NSString *key = Trim((prov == 0 ? self.geminiKey.text : self.claudeKey.text) ? (prov == 0 ? self.geminiKey.text : self.claudeKey.text) : @"");
+    NSString *rawKey = (prov == 0) ? self.geminiKey.text : self.claudeKey.text;
+    NSString *key = Trim(rawKey ? rawKey : @"");
     if (key.length == 0) {
         [self log:@"Chưa nhập API Key cho nhà cung cấp đã chọn."];
         return;
