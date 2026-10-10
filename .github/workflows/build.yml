@@ -26,13 +26,14 @@ jobs:
             -std=c++17 \
             -fobjc-arc \
             -O2 \
-            -miphoneos-version-min=13.0 \
+            -miphoneos-version-min=14.0 \
             -isysroot "$SDK" \
             -framework UIKit \
             -framework Foundation \
             -framework CoreGraphics \
             -framework QuartzCore \
             -framework WebKit \
+            -framework PhotosUI \
             -install_name @executable_path/Frameworks/AIMOLCore.dylib \
             -o AIMOLCore.dylib \
             main.mm
@@ -43,6 +44,8 @@ jobs:
           file AIMOLCore.dylib
           lipo -info AIMOLCore.dylib
           otool -L AIMOLCore.dylib
+          echo "--- symbol chưa định nghĩa (nm -u) ---"
+          nm -u AIMOLCore.dylib | head -80
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
