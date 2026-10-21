@@ -37,7 +37,7 @@
 
 #pragma mark - Cấu hình (sửa tại đây nếu cần)
 
-static NSString *const kGeminiModel    = @"gemini-2.5-flash";
+static NSString *const kGeminiModel    = @"gemini-3.8-flash";
 static NSString *const kClaudeModel    = @"claude-sonnet-5-5";
 static NSString *const kPatchStore     = @"aimol.patches";
 static NSString *const kUIStateKey     = @"aimol.ui";
@@ -1341,7 +1341,7 @@ static void AskAI(NSInteger provider, NSString *key, NSString *prompt, NSString 
         [contents addObject:@{@"role": @"user", @"parts": parts}];
         body = @{@"system_instruction": @{@"parts": @[@{@"text": AIMOLSystemRules()}]},
                  @"contents": contents,
-                 @"generationConfig": @{@"maxOutputTokens": @4096}};
+                 @"generationConfig": @{@"maxOutputTokens": @8192}};
     } else {
         req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://api.anthropic.com/v1/messages"]];
         [req setValue:key forHTTPHeaderField:@"x-api-key"];
