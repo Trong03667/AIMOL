@@ -16,6 +16,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <WebKit/WebKit.h>
 #import <PhotosUI/PhotosUI.h>
+#import <Security/Security.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
@@ -39,6 +40,9 @@
 
 static NSString *const kGeminiModel    = @"gemini-3.8-flash";
 static NSString *const kClaudeModel    = @"claude-sonnet-5-5";
+// Gateway do người triển khai AIMOL tự cấu hình; không nhúng khóa nhà cung cấp vào dylib.
+static NSString *const kAIMOLGatewayURLKey   = @"aimol.gateway.url";
+static NSString *const kAIMOLGatewayTokenKey = @"aimol.gateway.token";
 static NSString *const kPatchStore     = @"aimol.patches";
 static NSString *const kUIStateKey     = @"aimol.ui";
 static NSString *const kSkipKey        = @"aimol.dump.skip";
@@ -62,6 +66,38 @@ static NSString *CStr(const char *c) {
 
 static NSString *Trim(NSString *s) {
     return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+// Lưu token truy cập gateway trong Keychain; khóa API nhà cung cấp không được lưu trên thiết bị.
+static NSString *AIMOLGatewayTokenRead(void) {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"com.aimol.gateway",
+        (__bridge id)kSecAttrAccount: @"gateway-access-token",
+        (__bridge id)kSecReturnData: @YES,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
+    };
+    CFTypeRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    if (status != errSecSuccess || !result) return @"";
+    NSData *data = CFBridgingRelease(result);
+    NSString *value = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return value ?: @"";
+}
+
+static void AIMOLGatewayTokenWrite(NSString *token) {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"com.aimol.gateway",
+        (__bridge id)kSecAttrAccount: @"gateway-access-token"
+    };
+    SecItemDelete((__bridge CFDictionaryRef)query);
+    NSString *clean = Trim(token ?: @"");
+    if (!clean.length) return;
+    NSMutableDictionary *item = [query mutableCopy];
+    item[(__bridge id)kSecValueData] = [clean dataUsingEncoding:NSUTF8StringEncoding];
+    item[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+    SecItemAdd((__bridge CFDictionaryRef)item, NULL);
 }
 
 #pragma mark - IL2CPP bindings (nạp động bằng dlsym)
@@ -102,6 +138,9 @@ static void*       (*il_property_get_get_method)(void *);
 static void*       (*il_property_get_set_method)(void *);
 static bool        (*il_type_is_byref)(void *);
 static void        (*il_runtime_class_init)(void *);
+static uint16_t*   (*il_string_chars)(void *);
+static int32_t     (*il_string_length)(void *);
+static uint32_t    (*il_type_get_attrs)(void *);
 
 static BOOL gIl2cppReady = NO;
 static NSString *gIl2cppError = nil;
@@ -142,6 +181,8 @@ static BOOL LoadIl2cpp(void) {
     AIMOL_SYM(property_get_set_method);
     AIMOL_SYM(type_is_byref);
     AIMOL_SYM(runtime_class_init);
+    AIMOL_SYM(string_chars);          AIMOL_SYM(string_length);
+    AIMOL_SYM(type_get_attrs);
 #undef AIMOL_SYM
 
     NSMutableString *missing = [NSMutableString string];
@@ -411,7 +452,8 @@ static BOOL gLastDumpOK = NO;
 
 static NSArray<NSString *> *DumpKeywords(void) {
     return @[@"Car", @"Vehicle", @"Physics", @"Wheel", @"Engine", @"Suspension", @"Speed",
-             @"Torque", @"Power", @"Rpm", @"Brake", @"Gear", @"Color", @"Paint", @"Rigidbody"];
+             @"Torque", @"Power", @"Rpm", @"Brake", @"Gear", @"Color", @"Paint", @"Rigidbody",
+             @"Horse", @"Hp"];
 }
 
 // Khớp từ khóa. Từ khóa ngắn ("car") yêu cầu ranh giới từ để tránh Card, Scar, Carpet...
@@ -472,6 +514,147 @@ static NSString *TypeVisStr(int32_t f) {
     }
 }
 
+// Giá trị của field hằng (const/enum). Chỉ đọc kiểu nguyên thủy, enum và String; kiểu khác trả nil.
+static NSString *LiteralValueString(void *fld, NSString *typeName, BOOL enumOwner) {
+    if (!il_field_static_get_value) return nil;
+    BOOL isStr = [typeName isEqualToString:@"String"];
+    BOOL isFloat = [typeName isEqualToString:@"Single"];
+    BOOL isDouble = [typeName isEqualToString:@"Double"];
+    BOOL isBool = [typeName isEqualToString:@"Boolean"];
+    BOOL isInt = enumOwner ||
+        [typeName isEqualToString:@"SByte"] || [typeName isEqualToString:@"Byte"] ||
+        [typeName isEqualToString:@"Int16"] || [typeName isEqualToString:@"UInt16"] || [typeName isEqualToString:@"Char"] ||
+        [typeName isEqualToString:@"Int32"] || [typeName isEqualToString:@"UInt32"] ||
+        [typeName isEqualToString:@"Int64"] || [typeName isEqualToString:@"UInt64"];
+    if (!isStr && !isFloat && !isDouble && !isBool && !isInt) return nil;
+
+    uint64_t buf[2] = {0, 0};          // vùng đệm dư 16 byte
+    il_field_static_get_value(fld, buf);
+    uint64_t v = buf[0];
+
+    if (isStr) {
+        void *sp = (void *)(uintptr_t)v;
+        if ((uintptr_t)sp < 0x10000) return @"null";
+        if (!il_string_chars) return @"\"?\"";
+        uint16_t *ch = il_string_chars(sp);
+        if (!ch) return @"null";
+        int32_t n = il_string_length ? il_string_length(sp) : -1;
+        BOOL cut = NO;
+        if (n < 0) { n = 0; while (n < 160 && ch[n] != 0) n++; }
+        else if (n > 160) { n = 160; cut = YES; }
+        NSString *str = [NSString stringWithCharacters:(const unichar *)ch length:(NSUInteger)n];
+        str = [str stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+        str = [str stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+        str = [str stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
+        str = [str stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
+        str = [str stringByReplacingOccurrencesOfString:@"\t" withString:@"\\t"];
+        return [NSString stringWithFormat:@"\"%@\"%@", str, cut ? @"…" : @""];
+    }
+    if (isFloat) { float f; memcpy(&f, &buf[0], 4); return [NSString stringWithFormat:@"%gf", (double)f]; }
+    if (isDouble) { double d; memcpy(&d, &buf[0], 8); return [NSString stringWithFormat:@"%g", d]; }
+    if (isBool) return (v & 0xFF) ? @"true" : @"false";
+    if ([typeName isEqualToString:@"SByte"]) return [NSString stringWithFormat:@"%d", (int)(int8_t)v];
+    if ([typeName isEqualToString:@"Int16"]) return [NSString stringWithFormat:@"%d", (int)(int16_t)v];
+    if ([typeName isEqualToString:@"Int32"]) return [NSString stringWithFormat:@"%d", (int)(int32_t)v];
+    if ([typeName isEqualToString:@"Int64"]) return [NSString stringWithFormat:@"%lld", (long long)(int64_t)v];
+    if ([typeName isEqualToString:@"Byte"]) return [NSString stringWithFormat:@"%u", (unsigned)(v & 0xFF)];
+    if ([typeName isEqualToString:@"UInt16"] || [typeName isEqualToString:@"Char"]) return [NSString stringWithFormat:@"%u", (unsigned)(v & 0xFFFF)];
+    if ([typeName isEqualToString:@"UInt32"]) return [NSString stringWithFormat:@"%u", (unsigned)(v & 0xFFFFFFFFULL)];
+    if ([typeName isEqualToString:@"UInt64"]) return [NSString stringWithFormat:@"%llu", (unsigned long long)v];
+    // enum: chưa biết độ rộng thật, in dạng không dấu và chú thích thêm cách đọc int32 nếu cần
+    if (v >= 0x80000000ULL && v <= 0xFFFFFFFFULL) {
+        return [NSString stringWithFormat:@"%llu (int32: %d)", (unsigned long long)v, (int)(int32_t)v];
+    }
+    return [NSString stringWithFormat:@"%llu", (unsigned long long)v];
+}
+
+// Bổ từ của method (sau phần phạm vi truy cập), theo cùng quy tắc với dumper tham chiếu
+static NSString *MethodModifier(uint32_t mf) {
+    NSMutableString *s = [NSMutableString string];
+    if (mf & 0x10) [s appendString:@"static "];
+    BOOL reuse = ((mf & 0x100) == 0);    // VTABLE_LAYOUT_MASK: REUSE_SLOT = 0, NEW_SLOT = 0x100
+    if (mf & 0x400) {
+        [s appendString:@"abstract "];
+        if (reuse) [s appendString:@"override "];
+    } else if (mf & 0x20) {
+        if (reuse) [s appendString:@"sealed override "];
+    } else if (mf & 0x40) {
+        [s appendString:reuse ? @"override " : @"virtual "];
+    }
+    if (mf & 0x2000) [s appendString:@"extern "];
+    return s;
+}
+
+#pragma mark - Phân loại chủ đề cho file dump
+
+enum { kTopicVehicle = 0, kTopicSystemUI = 1, kTopicWorld = 2, kTopicEngine = 3, kTopicOther = 4, kTopicCount = 5 };
+
+static NSString *TopicFileName(int t) {
+    switch (t) {
+        case kTopicVehicle:  return @"xe_vat_ly";
+        case kTopicSystemUI: return @"he_thong_ui";
+        case kTopicWorld:    return @"ban_do_cong_trinh";
+        case kTopicEngine:   return @"thu_vien_engine";
+        default:             return @"khac";
+    }
+}
+
+static NSString *TopicTitle(int t) {
+    switch (t) {
+        case kTopicVehicle:  return @"Xe cộ / Vật lý";
+        case kTopicSystemUI: return @"Hệ thống / Giao diện";
+        case kTopicWorld:    return @"Bản đồ / Công trình";
+        case kTopicEngine:   return @"Thư viện / Engine";
+        default:             return @"Khác";
+    }
+}
+
+static NSArray<NSString *> *TopicKeywords(int t) {
+    switch (t) {
+        case kTopicVehicle:
+            return @[@"Car", @"Vehicle", @"Wheel", @"Engine", @"Suspension", @"Speed", @"Torque", @"Power", @"Rpm",
+                     @"Brake", @"Gear", @"Physics", @"Rigidbody", @"Collider", @"Tire", @"Tyre", @"Steer", @"Turbo",
+                     @"Nitro", @"Drift", @"Horse", @"Hp", @"Paint", @"Exhaust", @"Spoiler", @"Fuel", @"Clutch"];
+        case kTopicSystemUI:
+            return @[@"UI", @"Menu", @"Button", @"Canvas", @"Panel", @"Popup", @"Screen", @"Dialog", @"Window", @"Settings",
+                     @"Audio", @"Sound", @"Input", @"Touch", @"Network", @"Photon", @"Server", @"Room", @"Player",
+                     @"Profile", @"Shop", @"Store", @"Manager", @"Language", @"Localiz", @"Notification", @"Chat",
+                     @"Friend", @"Lobby"];
+        case kTopicWorld:
+            return @[@"Map", @"Building", @"Garage", @"House", @"Road", @"Terrain", @"Scene", @"Level", @"Track", @"City",
+                     @"Prop", @"Spawn", @"Gate", @"Bridge", @"Parking", @"Environment", @"Weather", @"Traffic"];
+        default:
+            return @[];
+    }
+}
+
+// Thư viện/engine nhận biết theo tên image, không cần chấm điểm
+static BOOL IsLibraryImage(NSString *imageName) {
+    NSArray<NSString *> *prefixes = @[@"UnityEngine", @"Unity.", @"System", @"mscorlib", @"Mono.", @"netstandard",
+                                      @"Newtonsoft", @"TextMeshPro", @"DOTween", @"Google", @"Firebase", @"Facebook"];
+    for (NSString *p in prefixes) {
+        if ([imageName hasPrefix:p]) return YES;
+    }
+    return NO;
+}
+
+// Chọn chủ đề có điểm cao nhất (tên class khớp 3 điểm, tên field khớp 1 điểm, tối đa 3 field); hòa thì theo thứ tự xe, hệ thống, bản đồ
+static int TopicForClass(NSString *imageName, NSString *fullName, NSString *fieldNames) {
+    if (IsLibraryImage(imageName)) return kTopicEngine;
+    int best = kTopicOther;
+    int bestScore = 0;
+    for (int t = kTopicVehicle; t <= kTopicWorld; t++) {
+        int score = 0;
+        int fieldHits = 0;
+        for (NSString *kw in TopicKeywords(t)) {
+            if (HasKeyword(fullName, kw)) score += 3;
+            else if (fieldHits < 3 && HasKeyword(fieldNames, kw)) { score += 1; fieldHits++; }
+        }
+        if (score > bestScore) { bestScore = score; best = t; }
+    }
+    return best;
+}
+
 // Dump một class thành văn bản kiểu C#. Trả NO nếu class không hợp lệ.
 static BOOL ProcessClass(void *k, NSString **outText, NSString **outFullName, NSString **outFieldNames) {
     const char *rawName = il_class_get_name(k);
@@ -521,8 +704,13 @@ static BOOL ProcessClass(void *k, NSString **outText, NSString **outFullName, NS
             if (ff & 0x20) [fields appendString:@"readonly "];
         }
         [fields appendFormat:@"%@ %@", ftype, fname];
-        if (isConst) [fields appendString:@";\n"];
-        else [fields appendFormat:@"; // 0x%zX\n", il_field_get_offset(fld)];
+        if (isConst) {
+            NSString *lit = LiteralValueString(fld, ftype, isEnum ? YES : NO);
+            if (lit) [fields appendFormat:@" = %@;\n", lit];
+            else [fields appendString:@";\n"];
+        } else {
+            [fields appendFormat:@"; // 0x%zX\n", il_field_get_offset(fld)];
+        }
         [fieldNames appendFormat:@"%@ ", fname];
     }
     if (fields.length > 0) [b appendFormat:@"\t// Fields\n%@", fields];
@@ -577,6 +765,10 @@ static BOOL ProcessClass(void *k, NSString **outText, NSString **outFullName, NS
             }
         }
         NSString *ret = (il_method_get_return_type != NULL) ? TypeName(il_method_get_return_type(m)) : @"?";
+        if (il_method_get_return_type != NULL && il_type_is_byref != NULL) {
+            void *rtype = il_method_get_return_type(m);
+            if (rtype && il_type_is_byref(rtype)) ret = [@"ref " stringByAppendingString:ret];
+        }
         int32_t pc = il_method_get_param_count ? il_method_get_param_count(m) : 0;
         NSMutableString *ps = [NSMutableString string];
         for (int32_t i = 0; i < pc; i++) {
@@ -585,14 +777,23 @@ static BOOL ProcessClass(void *k, NSString **outText, NSString **outFullName, NS
             NSString *pnm = il_method_get_param_name ? CStr(il_method_get_param_name(m, (uint32_t)i)) : @"";
             if (pnm.length == 0) pnm = [NSString stringWithFormat:@"a%d", (int)i];
             if (i > 0) [ps appendString:@", "];
-            if (pt && il_type_is_byref && il_type_is_byref(pt)) [ps appendString:@"ref "];
+            if (pt) {
+                uint32_t pa = il_type_get_attrs ? il_type_get_attrs(pt) : 0;
+                BOOL byref = (il_type_is_byref != NULL) && il_type_is_byref(pt);
+                if (byref) {
+                    if ((pa & 2) && !(pa & 1)) [ps appendString:@"out "];
+                    else if ((pa & 1) && !(pa & 2)) [ps appendString:@"in "];
+                    else [ps appendString:@"ref "];
+                } else {
+                    if (pa & 1) [ps appendString:@"[In] "];
+                    if (pa & 2) [ps appendString:@"[Out] "];
+                }
+            }
             [ps appendFormat:@"%@ %@", ptn, pnm];
         }
         [methods appendString:@"\t"];
         [methods appendString:AccessStr((int32_t)mf)];
-        if (mf & 0x10) [methods appendString:@"static "];
-        if (mf & 0x400) [methods appendString:@"abstract "];
-        else if (mf & 0x40) [methods appendString:@"virtual "];
+        [methods appendString:MethodModifier(mf)];
         [methods appendFormat:@"%@ %@(%@); %@\n", ret, CStr(il_method_get_name(m)), ps, tail];
     }
     if (methods.length > 0) [b appendFormat:@"\n\t// Methods\n%@", methods];
@@ -632,6 +833,18 @@ static NSString *AIMOLDump(void (^progress)(double)) {
     NSString *opTag = OpBegin(@"DUMP");
     DumpMarkWrite(1, 0, 0);
 
+    // Tệp theo chủ đề: ghi tuần tự song song với tệp đầy đủ (không giữ gì thêm trong RAM)
+    FILE *tfp[kTopicCount];
+    size_t tcount[kTopicCount];
+    NSMutableArray<NSString *> *lastImg = [NSMutableArray array];
+    for (int t = 0; t < kTopicCount; t++) {
+        NSString *tp = [DocsDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"AIMOL_dump_%@.cs", TopicFileName(t)]];
+        [lastImg addObject:@""];
+        tcount[t] = 0;
+        tfp[t] = fopen(tp.fileSystemRepresentation, "w");
+        if (tfp[t]) fprintf(tfp[t], "// AIMOL dump - chủ đề: %s (một phần của AIMOL_dump.cs)\n\n", TopicTitle(t).UTF8String);
+    }
+
     NSMutableArray<NSDictionary *> *cache = [NSMutableArray array];
     NSArray<NSString *> *keywords = DumpKeywords();
     size_t done = 0, classCount = 0, skipped = 0;
@@ -647,6 +860,7 @@ static NSString *AIMOLDump(void (^progress)(double)) {
             NSString *line = [NSString stringWithFormat:@"// ===== Image %zu: %@ =====\n", i, CStr(il_image_get_name(img))];
             fputs(line.UTF8String, fp);
         }
+        NSString *imgName = il_image_get_name ? CStr(il_image_get_name(img)) : @"";
         size_t cc = il_image_get_class_count(img);
         for (size_t j = 0; j < cc; j++) {
             @autoreleasepool {
@@ -655,13 +869,27 @@ static NSString *AIMOLDump(void (^progress)(double)) {
                     skipped++;
                     continue;
                 }
-                DumpMarkWrite(1, (uint32_t)i, (uint32_t)j);   // nếu sập ngay sau dòng này, lần sau sẽ bỏ qua class này
+                DumpMarkWrite(1, (uint32_t)i, (uint32_t)j);
                 void *k = il_image_get_class(img, j);
                 if (k) {
                     NSString *text = nil, *fullName = nil, *fieldNames = nil;
                     if (ProcessClass(k, &text, &fullName, &fieldNames)) {
                         classCount++;
+                        // 1. Ghi tệp đầy đủ
                         fputs(text.UTF8String, fp);
+                        
+                        // 2. Ghi tệp phân loại theo chủ đề
+                        int topic = TopicForClass(imgName, fullName, fieldNames);
+                        if (tfp[topic]) {
+                            if (![lastImg[(NSUInteger)topic] isEqualToString:imgName]) {
+                                fprintf(tfp[topic], "// ===== Image: %s =====\n", imgName.UTF8String);
+                                lastImg[(NSUInteger)topic] = imgName;
+                            }
+                            fputs(text.UTF8String, tfp[topic]);
+                            tcount[topic]++;
+                        }
+                        
+                        // 3. Đưa vào RAM Cache cho AI
                         NSInteger score = 0;
                         for (NSString *kw in keywords) {
                             if (HasKeyword(fullName, kw)) { score = 5; break; }
@@ -694,6 +922,20 @@ static NSString *AIMOLDump(void (^progress)(double)) {
     fputs(footer.UTF8String, fp);
     fclose(fp);
 
+    // Đóng các tệp chủ đề và ghi chỉ mục
+    NSMutableString *topicNote = [NSMutableString stringWithString:@"\nTệp theo chủ đề (trong thư mục Documents):"];
+    NSMutableString *indexTxt = [NSMutableString stringWithString:@"AIMOL dump - chỉ mục các tệp theo chủ đề\n\n"];
+    for (int t = 0; t < kTopicCount; t++) {
+        long sz = 0;
+        if (tfp[t]) { sz = ftell(tfp[t]); fclose(tfp[t]); tfp[t] = NULL; }
+        NSString *line = [NSString stringWithFormat:@"%@ | AIMOL_dump_%@.cs | %zu class | %ld KB",
+                          TopicTitle(t), TopicFileName(t), tcount[t], sz / 1024];
+        [indexTxt appendFormat:@"%@\n", line];
+        [topicNote appendFormat:@"\n  - %@", line];
+    }
+    [indexTxt writeToFile:[DocsDir() stringByAppendingPathComponent:@"AIMOL_dump_index.txt"]
+               atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
     DumpMarkWrite(0, 0, 0);
     OpEnd(opTag, [NSString stringWithFormat:@"ok %zu class", classCount]);
 
@@ -703,8 +945,8 @@ static NSString *AIMOLDump(void (^progress)(double)) {
     }
     gLastDumpOK = YES;
     NSString *skipNote = skipped > 0 ? [NSString stringWithFormat:@"\nĐã bỏ qua %zu class từng làm game sập.", skipped] : @"";
-    return [NSString stringWithFormat:@"✅ Dump Completed: %zu assembly, %zu class, %lu class khớp từ khóa (đã lưu RAM Cache).%@\nModule: %@\nFile đầy đủ: %@\n(Bấm nút chia sẻ ở thanh trên để lưu file ra ứng dụng Tệp.)",
-            asmCount, classCount, (unsigned long)cache.count, skipNote, mod.length ? mod : @"?", path];
+    return [NSString stringWithFormat:@"✅ Dump Completed: %zu assembly, %zu class, %lu class khớp từ khóa (đã lưu RAM Cache).%@%@\nModule: %@\nFile đầy đủ: %@\n(Bấm nút chia sẻ ở thanh trên để lưu file ra ứng dụng Tệp.)",
+            asmCount, classCount, (unsigned long)cache.count, skipNote, topicNote, mod.length ? mod : @"?", path];
 }
 
 // Lấy các class liên quan nhất tới câu hỏi để gửi kèm cho AI (giới hạn theo kDumpContextBudget)
@@ -1312,7 +1554,10 @@ static NSString *AIMOLSystemRules(void) {
     @"   LƯU Ý: offset của field trong Dump là offset TRONG đối tượng, KHÔNG phải địa chỉ từ đầu module. Nếu không có static_field phù hợp, hãy nói rõ thay vì đoán.\n"
     @"6) Script JS đặt trong khối ```js (chỉ chạy được với game HTML5/WKWebView). Giao diện HTML đặt trong khối ```html; "
     @"trang HTML gọi window.webkit.messageHandlers.aimol.postMessage(JSON.stringify(patch)) để áp dụng patch và định nghĩa window.aimolResult=function(text){...} để nhận kết quả.\n"
-    @"7) Ghi sai kiểu dữ liệu có thể làm văng game: hãy đề xuất giá trị vừa phải và nêu rủi ro nếu có. Nếu game ghi đè lại giá trị (thường ở sảnh), hãy nói rõ là cách này không bền.";
+    @"7) Ghi sai kiểu dữ liệu có thể làm văng game: hãy đề xuất giá trị vừa phải và nêu rủi ro nếu có. Nếu game ghi đè lại giá trị (thường ở sảnh), hãy nói rõ là cách này không bền.\n"
+    @"8) CHẾ ĐỘ KIỂM THỬ BETA CÓ KIỂM SOÁT: chỉ phân tích khi người dùng bấm Gửi; chỉ dựa trên ảnh/Dump/ngữ cảnh được cung cấp. Ưu tiên đọc và chẩn đoán trước, nêu giả thuyết + cách kiểm chứng, không tự thực thi patch, JS, hook hoặc ghi bộ nhớ. Mọi thay đổi chỉ được thực hiện sau thao tác riêng của người dùng tại nút Áp dụng; không nói rằng đã áp dụng nếu chưa có kết quả thực tế.\n"
+    @"9) Nếu người sử dụng yêu cầu làm gì đó nếu có thể thì hãy tìm mọi cách để đáp ứng như cầu của ngươid dùng.\n"
+    @"10) Không tự chạy khi khởi động, không tự gọi mạng, không tự dump và không tự sửa dữ liệu. Nếu thiếu thông tin, hãy hỏi người dùng hoặc đề nghị thao tác kiểm tra thủ công thay vì đoán.";
 }
 
 static NSString *ErrMsg(id j) {
@@ -1323,92 +1568,168 @@ static NSString *ErrMsg(id j) {
     return nil;
 }
 
-static void AskAI(NSInteger provider, NSString *key, NSString *prompt, NSString *b64,
-                  NSArray<NSDictionary *> *history, void (^done)(NSString *, BOOL)) {
-    NSMutableURLRequest *req = nil;
-    NSDictionary *body = nil;
-    if (provider == 0) {
-        NSString *url = [NSString stringWithFormat:@"https://generativelanguage.googleapis.com/v1beta/models/%@:generateContent", kGeminiModel];
-        req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
-        [req setValue:key forHTTPHeaderField:@"x-goog-api-key"];
-        NSMutableArray *contents = [NSMutableArray array];
-        for (NSDictionary *h in history) {
-            [contents addObject:@{@"role": @"user", @"parts": @[@{@"text": h[@"q"]}]}];
-            [contents addObject:@{@"role": @"model", @"parts": @[@{@"text": h[@"a"]}]}];
-        }
-        NSMutableArray *parts = [NSMutableArray arrayWithObject:@{@"text": prompt}];
-        if (b64.length) [parts addObject:@{@"inline_data": @{@"mime_type": @"image/jpeg", @"data": b64}}];
-        [contents addObject:@{@"role": @"user", @"parts": parts}];
-        body = @{@"system_instruction": @{@"parts": @[@{@"text": AIMOLSystemRules()}]},
-                 @"contents": contents,
-                 @"generationConfig": @{@"maxOutputTokens": @8192}};
-    } else {
-        req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://api.anthropic.com/v1/messages"]];
-        [req setValue:key forHTTPHeaderField:@"x-api-key"];
-        [req setValue:@"2023-06-01" forHTTPHeaderField:@"anthropic-version"];
-        NSMutableArray *messages = [NSMutableArray array];
-        for (NSDictionary *h in history) {
-            [messages addObject:@{@"role": @"user", @"content": h[@"q"]}];
-            [messages addObject:@{@"role": @"assistant", @"content": h[@"a"]}];
-        }
-        NSMutableArray *content = [NSMutableArray array];
-        if (b64.length) {
-            [content addObject:@{@"type": @"image",
-                                 @"source": @{@"type": @"base64", @"media_type": @"image/jpeg", @"data": b64}}];
-        }
-        [content addObject:@{@"type": @"text", @"text": prompt}];
-        [messages addObject:@{@"role": @"user", @"content": content}];
-        body = @{@"model": kClaudeModel, @"max_tokens": @4096, @"system": AIMOLSystemRules(), @"messages": messages};
-    }
-    req.HTTPMethod = @"POST";
-    req.timeoutInterval = 90;
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+// Chấm độ phức tạp dựa trên câu hỏi người dùng, không dựa vào độ dài Dump.
+static NSInteger AIMOLComplexityScore(NSString *question, BOOL hasImage, BOOL hasDump) {
+    NSString *q = [[question ?: @""] lowercaseString];
+    NSInteger score = 0;
+    if (q.length > 350) score++;
+    if (q.length > 900) score++;
+    NSArray<NSString *> *technical = @[@"offset", @"il2cpp", @"dump", @"hook", @"patch", @"memory", @"bộ nhớ", @"crash", @"sập game", @"rva", @"pointer", @"địa chỉ", @"phân tích", @"so sánh", @"tối ưu", @"debug", @"lỗi biên dịch"];
+    NSUInteger hits = 0;
+    for (NSString *word in technical) if ([q containsString:word]) hits++;
+    if (hits >= 2) score++;
+    if (hits >= 5) score++;
+    NSUInteger questions = [[q componentsSeparatedByString:@"?"] count] - 1;
+    if (questions >= 2) score++;
+    NSArray<NSString *> *multi = @[@"đồng thời", @"từng bước", @"toàn bộ", @"nhiều cách", @"ưu nhược điểm", @"hãy thiết kế", @"hãy triển khai", @"tìm nguyên nhân", @"so sánh"];
+    for (NSString *word in multi) { if ([q containsString:word]) { score++; break; } }
+    if (hasImage) score++;
+    if (hasDump) score++;
+    return MIN(score, 8);
+}
 
+static NSString *AIMOLModeForScore(NSInteger score) {
+    if (score <= 1) return @"fast";
+    if (score <= 3) return @"balanced";
+    return @"debate";
+}
+
+static NSString *AIMOLProviderError(id j) {
+    @try {
+        id e = j[@"error"];
+        if ([e isKindOfClass:[NSDictionary class]]) {
+            id m = e[@"message"] ?: e[@"detail"];
+            if ([m isKindOfClass:[NSString class]]) return m;
+        }
+        id m = j[@"message"] ?: j[@"detail"];
+        if ([m isKindOfClass:[NSString class]]) return m;
+    } @catch (NSException *ex) {}
+    return nil;
+}
+
+// Gateway contract: POST /v1/aimol/chat, OpenAI-style `choices[0].message.content`
+// (hoặc `reply`), và trường `aimol` để backend route Gemini/Claude -> Groq -> OpenRouter.
+// Khóa nhà cung cấp chỉ tồn tại ở backend; token phía client (nếu có) chỉ là token truy cập gateway.
+static void AIMOLGatewayAttempt(NSMutableURLRequest *req, NSInteger attempt,
+                                void (^done)(NSString *, BOOL)) {
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+            BOOL retryable = err != nil || code == 429 || code == 500 || code == 502 || code == 503 || code == 504;
+            if (retryable && attempt < 2) {
+                NSTimeInterval delay = attempt == 0 ? 1.0 : 2.0;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    AIMOLGatewayAttempt(req, attempt + 1, done);
+                });
+                return;
+            }
             NSString *out = nil;
             BOOL ok = NO;
             if (err) {
-                out = [NSString stringWithFormat:@"❌ Lỗi mạng: %@", err.localizedDescription];
+                out = [NSString stringWithFormat:@"❌ Lỗi mạng tới AIMOL Gateway: %@", err.localizedDescription];
             } else {
-                NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
                 id j = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-                NSMutableString *text = [NSMutableString string];
+                NSString *reply = nil;
                 @try {
-                    if (provider == 0) {
-                        NSArray *parts = j[@"candidates"][0][@"content"][@"parts"];
-                        for (id p in parts) {
-                            NSString *t = p[@"text"];
-                            if ([t isKindOfClass:[NSString class]]) [text appendString:t];
-                        }
-                    } else {
-                        NSArray *content = j[@"content"];
-                        for (id c in content) {
-                            if ([c[@"type"] isEqual:@"text"]) {
-                                NSString *t = c[@"text"];
-                                if ([t isKindOfClass:[NSString class]]) [text appendString:t];
-                            }
-                        }
+                    id content = j[@"choices"][0][@"message"][@"content"];
+                    if ([content isKindOfClass:[NSString class]]) reply = content;
+                    else if ([content isKindOfClass:[NSArray class]]) {
+                        NSMutableString *joined = [NSMutableString string];
+                        for (id part in content) if ([part isKindOfClass:[NSDictionary class]] && [part[@"text"] isKindOfClass:[NSString class]]) [joined appendString:part[@"text"]];
+                        if (joined.length) reply = joined;
                     }
-                } @catch (NSException *ex) {
-                    [text setString:@""];
-                }
-                if (text.length > 0 && code >= 200 && code < 300) {
-                    out = text;
+                    if (!reply.length && [j[@"reply"] isKindOfClass:[NSString class]]) reply = j[@"reply"];
+                } @catch (NSException *ex) {}
+                if (code >= 200 && code < 300 && reply.length) {
+                    out = reply;
                     ok = YES;
                 } else {
-                    NSString *em = ErrMsg(j);
-                    if (!em) {
-                        NSString *raw = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
+                    NSString *em = AIMOLProviderError(j);
+                    if (!em.length) {
+                        NSString *raw = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"Gateway không trả nội dung.";
                         em = raw.length > 500 ? [raw substringToIndex:500] : raw;
                     }
-                    out = [NSString stringWithFormat:@"❌ Lỗi API (HTTP %ld): %@", (long)code, em];
+                    out = [NSString stringWithFormat:@"❌ AIMOL Gateway (HTTP %ld): %@", (long)code, em];
+                    if (code == 401 || code == 403) out = [out stringByAppendingString:@"\nKiểm tra token truy cập Gateway; không nhập API key Gemini/Claude/Groq/OpenRouter vào ứng dụng."];
+                    if (code == 404) out = [out stringByAppendingString:@"\nGateway chưa triển khai endpoint POST /v1/aimol/chat theo hợp đồng trong main.mm."];
                 }
             }
-            dispatch_async(dispatch_get_main_queue(), ^{ done(out, ok); });
+            dispatch_async(dispatch_get_main_queue(), ^{ done(out ?: @"❌ Gateway không trả kết quả.", ok); });
         }];
     [task resume];
+}
+
+static void AskAI(NSInteger preferredProvider, NSString *gatewayURL, NSString *gatewayToken,
+                  NSString *question, NSString *prompt, NSString *b64,
+                  NSArray<NSDictionary *> *history, BOOL hasDump,
+                  void (^done)(NSString *, BOOL)) {
+    NSString *urlText = Trim(gatewayURL ?: @"");
+    NSURL *url = [NSURL URLWithString:urlText];
+    if (!url || !url.host.length || ![[url.scheme lowercaseString] isEqualToString:@"https"]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            done(@"❌ Chưa cấu hình AIMOL Gateway URL hợp lệ. Nhập URL HTTPS của máy chủ trung gian vào ô Gateway URL. main.mm không thể tự tạo máy chủ hoặc quản lý khóa API chung thay cho backend.", NO);
+        });
+        return;
+    }
+    // Cho phép nhập base URL; tự thêm endpoint nếu người dùng chưa nhập endpoint đầy đủ.
+    NSString *lowerPath = url.path.lowercaseString;
+    if (![lowerPath hasSuffix:@"/v1/aimol/chat"]) {
+        NSString *base = [urlText hasSuffix:@"/"] ? [urlText substringToIndex:urlText.length - 1] : urlText;
+        url = [NSURL URLWithString:[base stringByAppendingString:@"/v1/aimol/chat"]];
+    }
+    NSInteger score = AIMOLComplexityScore(question, b64.length > 0, hasDump);
+    NSString *mode = AIMOLModeForScore(score);
+    NSString *preferred = preferredProvider == 1 ? @"claude" : @"gemini";
+    NSArray *priority = preferredProvider == 1
+        ? @[@"claude", @"gemini", @"groq", @"openrouter"]
+        : @[@"gemini", @"claude", @"groq", @"openrouter"];
+    NSMutableArray *messages = [NSMutableArray arrayWithObject:@{@"role": @"system", @"content": AIMOLSystemRules()}];
+    for (NSDictionary *h in history) {
+        if ([h[@"q"] isKindOfClass:[NSString class]] && [h[@"a"] isKindOfClass:[NSString class]]) {
+            [messages addObject:@{@"role": @"user", @"content": h[@"q"]}];
+            [messages addObject:@{@"role": @"assistant", @"content": h[@"a"]}];
+        }
+    }
+    id userContent = prompt ?: @"";
+    if (b64.length) {
+        userContent = @[
+            @{@"type": @"text", @"text": prompt ?: @""},
+            @{@"type": @"image_url", @"image_url": @{@"url": [@"data:image/jpeg;base64," stringByAppendingString:b64]}}
+        ];
+    }
+    [messages addObject:@{@"role": @"user", @"content": userContent}];
+    NSDictionary *aimol = @{
+        @"mode": mode,
+        @"complexity_score": @(score),
+        @"preferred_provider": preferred,
+        @"provider_priority": priority,
+        @"fallback_providers": @[@"groq", @"openrouter"],
+        @"max_agents": @( [mode isEqualToString:@"debate"] ? 3 : ([mode isEqualToString:@"balanced"] ? 2 : 1) ),
+        @"system_rules": AIMOLSystemRules(),
+        @"shared_provider_keys": @YES
+    };
+    NSDictionary *body = @{
+        @"model": @"aimol/auto",
+        @"messages": messages,
+        @"max_tokens": @8192,
+        @"temperature": @0.4,
+        @"aimol": aimol
+    };
+    NSError *jsonError = nil;
+    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:body options:0 error:&jsonError];
+    if (!bodyData) {
+        dispatch_async(dispatch_get_main_queue(), ^{ done([NSString stringWithFormat:@"❌ Không tạo được JSON request: %@", jsonError.localizedDescription ?: @"lỗi không xác định"], NO); });
+        return;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 90;
+    req.HTTPBody = bodyData;
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    NSString *token = Trim(gatewayToken ?: @"");
+    if (token.length) [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    AIMOLGatewayAttempt(req, 0, done);
 }
 
 #pragma mark - Ảnh chụp màn hình
@@ -1574,8 +1895,8 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
 @property (nonatomic, strong) UISegmentedControl *tabSeg;
 @property (nonatomic, strong) UIView *tabChat;
 @property (nonatomic, strong) UISegmentedControl *provSeg;
-@property (nonatomic, strong) UITextField *geminiKey;
-@property (nonatomic, strong) UITextField *claudeKey;
+@property (nonatomic, strong) UITextField *gatewayURLField;
+@property (nonatomic, strong) UITextField *gatewayTokenField;
 @property (nonatomic, strong) UITextView *chat;
 @property (nonatomic, strong) UIView *swRow;
 @property (nonatomic, strong) UISwitch *swImg;
@@ -1587,6 +1908,11 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) UIView *tabTools;
 @property (nonatomic, strong) UIButton *designRowBtn;
+@property (nonatomic, strong) UIButton *fiapRowBtn;
+@property (nonatomic, strong) UIView *fiapPanel;
+@property (nonatomic, strong) UISwitch *fiapEnableSwitch;
+@property (nonatomic, strong) UILabel *fiapStatusLabel;
+@property (nonatomic) BOOL fiapPanelOpen;
 @property (nonatomic, strong) UITextField *searchField;
 @property (nonatomic, strong) UITableView *resultsTable;
 @property (nonatomic, strong) UILabel *resultsHint;
@@ -1682,7 +2008,8 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
     t.delegate = self;
     t.returnKeyType = UIReturnKeyDone;
     if (dkey) {
-        t.text = [[NSUserDefaults standardUserDefaults] stringForKey:dkey];
+        if ([dkey isEqualToString:kAIMOLGatewayTokenKey]) t.text = AIMOLGatewayTokenRead();
+        else t.text = [[NSUserDefaults standardUserDefaults] stringForKey:dkey];
         [t addTarget:self action:@selector(saveKeys) forControlEvents:UIControlEventEditingChanged];
     }
     return t;
@@ -1690,8 +2017,8 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
 
 - (void)saveKeys {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setObject:(self.geminiKey.text ? self.geminiKey.text : @"") forKey:@"aimol.gemini"];
-    [ud setObject:(self.claudeKey.text ? self.claudeKey.text : @"") forKey:@"aimol.claude"];
+    [ud setObject:(self.gatewayURLField.text ? self.gatewayURLField.text : @"") forKey:kAIMOLGatewayURLKey];
+    AIMOLGatewayTokenWrite(self.gatewayTokenField.text ?: @"");
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
@@ -1797,8 +2124,8 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
     self.tabTools.frame = CGRectMake(10, y0, cw, ch);
     // CHAT AI
     self.provSeg.frame = CGRectMake(0, 0, cw, 28);
-    self.geminiKey.frame = CGRectMake(0, 32, cw / 2 - 2, 30);
-    self.claudeKey.frame = CGRectMake(cw / 2 + 2, 32, cw / 2 - 2, 30);
+    self.gatewayURLField.frame = CGRectMake(0, 32, cw / 2 - 2, 30);
+    self.gatewayTokenField.frame = CGRectMake(cw / 2 + 2, 32, cw / 2 - 2, 30);
     self.chat.frame = CGRectMake(0, 66, cw, MAX((CGFloat)40, ch - 136));
     self.swRow.frame = CGRectMake(0, ch - 68, cw, 28);
     self.swImg.center = CGPointMake(20, 14);
@@ -1807,11 +2134,16 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
     self.lblDump.frame = CGRectMake(148, 0, 80, 28);
     self.input.frame = CGRectMake(0, ch - 34, cw - 64, 32);
     self.sendBtn.frame = CGRectMake(cw - 60, ch - 34, 60, 32);
-    // CÔNG CỤ
+    // CÔNG CỤ: FIAP chỉ hiển thị trạng thái; chưa cài chức năng.
     self.designRowBtn.frame = CGRectMake(0, 0, cw, 34);
-    self.searchField.frame = CGRectMake(0, 40, cw, 30);
-    self.resultsTable.frame = CGRectMake(0, 74, cw, MAX((CGFloat)40, ch - 74));
-    self.resultsHint.frame = CGRectMake(12, 82, MAX((CGFloat)40, cw - 24), 60);
+    self.fiapRowBtn.frame = CGRectMake(0, 38, cw, 34);
+    self.fiapPanel.frame = CGRectMake(0, 76, cw, self.fiapPanelOpen ? 76 : 0);
+    self.fiapPanel.hidden = !self.fiapPanelOpen;
+    self.searchField.frame = CGRectMake(0, self.fiapPanelOpen ? 158 : 80, cw, 30);
+    self.resultsTable.frame = CGRectMake(0, self.fiapPanelOpen ? 192 : 114, cw, MAX((CGFloat)40, ch - (self.fiapPanelOpen ? 192 : 114)));
+    self.resultsHint.frame = CGRectMake(12, (self.fiapPanelOpen ? 200 : 122), MAX((CGFloat)40, cw - 24), 60);
+    self.fiapEnableSwitch.frame = CGRectMake(8, 6, 50, 31);
+    self.fiapStatusLabel.frame = CGRectMake(64, 4, MAX((CGFloat)80, cw - 72), 66);
 }
 
 - (void)layoutDesign {
@@ -1980,8 +2312,8 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
     self.tabChat = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 10)];
     self.provSeg = [[UISegmentedControl alloc] initWithItems:@[@"Gemini", @"Claude"]];
     self.provSeg.selectedSegmentIndex = 0;
-    self.geminiKey = [self makeField:@"Gemini API Key" secure:YES defaultsKey:@"aimol.gemini"];
-    self.claudeKey = [self makeField:@"Claude API Key" secure:YES defaultsKey:@"aimol.claude"];
+    self.gatewayURLField = [self makeField:@"Gateway URL (HTTPS)" secure:NO defaultsKey:kAIMOLGatewayURLKey];
+    self.gatewayTokenField = [self makeField:@"Gateway Token (bắt buộc)" secure:YES defaultsKey:kAIMOLGatewayTokenKey];
     self.chat = [[UITextView alloc] initWithFrame:CGRectMake(0, 0, 10, 10)];
     self.chat.editable = NO;
     self.chat.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1];
@@ -2010,7 +2342,7 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
     self.input.returnKeyType = UIReturnKeySend;
     self.sendBtn = TextButton(@"Gửi", 15, NO);
     [self.sendBtn addTarget:self action:@selector(onSend) forControlEvents:UIControlEventTouchUpInside];
-    NSArray<UIView *> *chatViews = @[self.provSeg, self.geminiKey, self.claudeKey, self.chat, self.swRow, self.input, self.sendBtn];
+    NSArray<UIView *> *chatViews = @[self.provSeg, self.gatewayURLField, self.gatewayTokenField, self.chat, self.swRow, self.input, self.sendBtn];
     for (UIView *v in chatViews) [self.tabChat addSubview:v];
     [self.panel addSubview:self.tabChat];
 
@@ -2037,6 +2369,33 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
     self.designRowBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 12, 0, 0);
     [self.designRowBtn addTarget:self action:@selector(onDesignRow) forControlEvents:UIControlEventTouchUpInside];
     [self.tabTools addSubview:self.designRowBtn];
+
+    self.fiapRowBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.fiapRowBtn.backgroundColor = [UIColor colorWithRed:118.0f/255 green:118.0f/255 blue:128.0f/255 alpha:0.24f];
+    self.fiapRowBtn.layer.cornerRadius = 8;
+    self.fiapRowBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    self.fiapRowBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 12, 0, 0);
+    [self.fiapRowBtn setTitle:@"▸   FIAP (đang tắt)" forState:UIControlStateNormal];
+    [self.fiapRowBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.fiapRowBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [self.fiapRowBtn addTarget:self action:@selector(onFIAPRow) forControlEvents:UIControlEventTouchUpInside];
+    [self.tabTools addSubview:self.fiapRowBtn];
+
+    self.fiapPanel = [[UIView alloc] initWithFrame:CGRectZero];
+    self.fiapPanel.hidden = YES;
+    self.fiapPanel.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1];
+    self.fiapPanel.layer.cornerRadius = 8;
+    self.fiapEnableSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    self.fiapEnableSwitch.on = NO;
+    [self.fiapEnableSwitch addTarget:self action:@selector(onFIAPSwitchChanged) forControlEvents:UIControlEventValueChanged];
+    [self.fiapPanel addSubview:self.fiapEnableSwitch];
+    self.fiapStatusLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.fiapStatusLabel.numberOfLines = 0;
+    self.fiapStatusLabel.font = [UIFont systemFontOfSize:11];
+    self.fiapStatusLabel.textColor = [UIColor colorWithWhite:0.82 alpha:1];
+    self.fiapStatusLabel.text = @"ĐANG ĐÓNG BĂNG. FIAP chưa chạy; không hook StoreKit. Bật công tắc để tạo các sự kiện mô phỏng và ghi log cục bộ.";
+    [self.fiapPanel addSubview:self.fiapStatusLabel];
+    [self.tabTools addSubview:self.fiapPanel];
 
     self.searchField = [self makeField:@"Tra cứu Dump: tìm class, field, method..." secure:NO defaultsKey:nil];
     [self.searchField addTarget:self action:@selector(onSearchChanged) forControlEvents:UIControlEventEditingChanged];
@@ -2426,10 +2785,14 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
     NSString *q = Trim(self.input.text ? self.input.text : @"");
     if (q.length == 0 || !self.sendBtn.enabled) return;
     NSInteger prov = self.provSeg.selectedSegmentIndex;
-    NSString *rawKey = (prov == 0) ? self.geminiKey.text : self.claudeKey.text;
-    NSString *key = Trim(rawKey ? rawKey : @"");
-    if (key.length == 0) {
-        [self log:@"Chưa nhập API Key cho nhà cung cấp đã chọn."];
+    NSString *gatewayURL = Trim(self.gatewayURLField.text ?: @"");
+    NSString *gatewayToken = Trim(self.gatewayTokenField.text ?: @"");
+    if (gatewayURL.length == 0) {
+        [self log:@"Chưa cấu hình Gateway URL HTTPS. AIMOL dùng máy chủ trung gian để giữ API key chung ở phía máy chủ."];
+        return;
+    }
+    if (gatewayToken.length == 0) {
+        [self log:@"Chưa có Gateway Token cá nhân. Hãy yêu cầu quản trị viên cấp token riêng; không nhập API key của nhà cung cấp vào đây."];
         return;
     }
     self.input.text = @"";
@@ -2444,7 +2807,7 @@ static UIButton *TextButton(NSString *title, CGFloat size, BOOL bold) {
     if (self.swDump.on) prompt = [prompt stringByAppendingString:BuildDumpContext(q)];
 
     NSArray<NSDictionary *> *hist = [self.history copy];
-    AskAI(prov, key, prompt, b64, hist, ^(NSString *reply, BOOL ok) {
+    AskAI(prov, gatewayURL, gatewayToken, q, prompt, b64, hist, self.swDump.on, ^(NSString *reply, BOOL ok) {
         self.sendBtn.enabled = YES;
         [self log:[@"AI: " stringByAppendingString:reply]];
         if (ok) {
@@ -2677,6 +3040,54 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
             [self setResults:res hint:(res.count ? @"" : @"Không có kết quả.")];
         });
     });
+}
+
+#pragma mark FIAP (mô phỏng có ghi log cục bộ; không hook StoreKit)
+
+- (void)fiapAppendLocalLog:(NSString *)event result:(NSString *)result detail:(NSString *)detail {
+    // Chỉ lưu nhật ký cục bộ. Mọi mục tạo bởi FIAP ở bản này đều được đánh dấu SIMULATED.
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableArray *logs = [[defaults arrayForKey:@"AIMOL.FIAP.LocalSimulationLogs"] mutableCopy];
+    if (!logs) logs = [NSMutableArray array];
+    NSDictionary *entry = @{
+        @"timestamp": [[NSDate date] description],
+        @"event": event ?: @"unknown",
+        @"result": result ?: @"unknown",
+        @"detail": detail ?: @"",
+        @"source": @"FIAP_SIMULATION_ONLY"
+    };
+    [logs addObject:entry];
+    while (logs.count > 200) [logs removeObjectAtIndex:0];
+    [defaults setObject:logs forKey:@"AIMOL.FIAP.LocalSimulationLogs"];
+    [defaults synchronize];
+}
+
+- (void)onFIAPRow {
+    self.fiapPanelOpen = !self.fiapPanelOpen;
+    self.fiapPanel.hidden = !self.fiapPanelOpen;
+    NSString *state = self.fiapEnableSwitch.isOn ? @"(mô phỏng)" : @"(đang tắt)";
+    NSString *prefix = self.fiapPanelOpen ? @"▾   FIAP " : @"▸   FIAP ";
+    [self.fiapRowBtn setTitle:[prefix stringByAppendingString:state] forState:UIControlStateNormal];
+    [self layoutPanel];
+    [self showNotice:(self.fiapPanelOpen ? @"Mở bảng FIAP. Chỉ mô phỏng và ghi log cục bộ; không cài hook StoreKit." : @"Đã thu gọn FIAP; không có tác vụ nền.") seconds:2 force:NO];
+}
+
+- (void)onFIAPSwitchChanged {
+    // Công tắc duy nhất bật/tắt mô phỏng. Không sửa giao dịch, receipt hoặc lưu lượng mạng.
+    BOOL enabled = self.fiapEnableSwitch.isOn;
+    if (enabled) {
+        [self fiapAppendLocalLog:@"SIMULATED_CAN_MAKE_PAYMENTS_CHECK" result:@"SIMULATED_ONLY" detail:@"Mô phỏng sự kiện kiểm tra khả năng thanh toán; không gọi hoặc thay thế StoreKit API."];
+        [self fiapAppendLocalLog:@"SIMULATED_TRANSACTION_STATE" result:@"SIMULATED_ONLY" detail:@"Mô phỏng sự kiện trạng thái giao dịch để kiểm thử báo cáo; không tạo giao dịch mua hàng."];
+        [self fiapAppendLocalLog:@"SIMULATED_RECEIPT_VERIFICATION" result:@"SIMULATED_ONLY" detail:@"Mô phỏng sự kiện xác minh biên lai; không tạo receipt và không chặn yêu cầu xác minh thật."];
+        self.fiapStatusLabel.text = @"ĐANG BẬT MÔ PHỎNG. Đã ghi 3 sự kiện SIMULATED vào nhật ký cục bộ. Không hook StoreKit, không sửa giao dịch/receipt, không chặn mạng và không gửi log đi.";
+    } else {
+        [self fiapAppendLocalLog:@"FIAP_SIMULATION_DISABLED" result:@"STOPPED" detail:@"Người dùng đã tắt mô phỏng."];
+        self.fiapStatusLabel.text = @"ĐANG ĐÓNG BĂNG. Không chạy mô phỏng nền; không hook StoreKit, không sửa giao dịch/receipt và không chặn mạng.";
+    }
+    NSString *state = enabled ? @"(mô phỏng)" : @"(đang tắt)";
+    NSString *prefix = self.fiapPanelOpen ? @"▾   FIAP " : @"▸   FIAP ";
+    [self.fiapRowBtn setTitle:[prefix stringByAppendingString:state] forState:UIControlStateNormal];
+    [self showNotice:(enabled ? @"FIAP: đã ghi log mô phỏng cục bộ; không can thiệp giao dịch thật." : @"FIAP đã tắt; đã ghi log cục bộ.") seconds:3 force:YES];
 }
 
 #pragma mark Design (cục tròn riêng + bảng ảnh)
