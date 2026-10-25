@@ -1570,7 +1570,7 @@ static NSString *ErrMsg(id j) {
 
 // Chấm độ phức tạp dựa trên câu hỏi người dùng, không dựa vào độ dài Dump.
 static NSInteger AIMOLComplexityScore(NSString *question, BOOL hasImage, BOOL hasDump) {
-    NSString *q = [[question ?: @""] lowercaseString];
+    NSString *q = [(question ?: @"") lowercaseString];
     NSInteger score = 0;
     if (q.length > 350) score++;
     if (q.length > 900) score++;
