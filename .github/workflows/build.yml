@@ -29,7 +29,8 @@ jobs:
             -miphoneos-version-min=14.0 \
             -isysroot "$SDK" \
             -framework UIKit \
-            -framework Foundation \
+            -framework Foundation
+            -framework Security \
             -framework CoreGraphics \
             -framework QuartzCore \
             -framework WebKit \
